@@ -1,0 +1,274 @@
+#!/bin/sh
+# configure - Generate config.h and config.mk for visual-traceroute
+set -e
+
+# Defaults
+CC="${CC:-cc}"
+PREFIX="/usr/local"
+WITH_NCURSES=auto
+WITH_CAIRO=auto
+WITH_FFMPEG=auto
+WITH_DNS_SD=auto
+WITH_AVAHI=auto
+WITH_LIBPNG=auto
+
+# Parse arguments
+for arg in "$@"; do
+    case "$arg" in
+        --prefix=*)    PREFIX="${arg#*=}" ;;
+        --cc=*)        CC="${arg#*=}" ;;
+        --without-ncurses) WITH_NCURSES=no ;;
+        --without-cairo)   WITH_CAIRO=no ;;
+        --without-ffmpeg)  WITH_FFMPEG=no ;;
+        --without-dns-sd)  WITH_DNS_SD=no ;;
+        --without-avahi)   WITH_AVAHI=no ;;
+        --without-libpng)  WITH_LIBPNG=no ;;
+        --with-ncurses)    WITH_NCURSES=yes ;;
+        --with-cairo)      WITH_CAIRO=yes ;;
+        --with-ffmpeg)     WITH_FFMPEG=yes ;;
+        --help)
+            echo "Usage: ./configure [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --prefix=DIR          Install prefix [/usr/local]"
+            echo "  --cc=COMPILER         C compiler [cc]"
+            echo "  --without-ncurses     Disable ncurses output"
+            echo "  --without-cairo       Disable PNG/MP4 output"
+            echo "  --without-ffmpeg      Disable MP4 output"
+            echo "  --without-dns-sd      Disable macOS mDNS"
+            echo "  --without-avahi       Disable Linux mDNS"
+            echo "  --without-libpng      Disable libpng"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg" >&2
+            exit 1
+            ;;
+    esac
+done
+
+echo "Configuring visual-traceroute..."
+
+# Detect OS
+OS=$(uname -s)
+case "$OS" in
+    Darwin) PLATFORM=darwin ;;
+    Linux)  PLATFORM=linux ;;
+    *)
+        echo "Unsupported platform: $OS" >&2
+        exit 1
+        ;;
+esac
+echo "  Platform: $PLATFORM"
+
+# Detect architecture
+ARCH=$(uname -m)
+echo "  Architecture: $ARCH"
+
+# Test compiler
+echo "  Compiler: $CC"
+if ! command -v "$CC" >/dev/null 2>&1; then
+    echo "Error: compiler '$CC' not found" >&2
+    exit 1
+fi
+
+# Check for pkg-config
+HAS_PKGCONFIG=no
+if command -v pkg-config >/dev/null 2>&1; then
+    HAS_PKGCONFIG=yes
+fi
+echo "  pkg-config: $HAS_PKGCONFIG"
+
+# Helper: try compile
+try_compile() {
+    local code="$1"
+    local flags="$2"
+    local tmpf=$(mktemp /tmp/ri_conf_XXXXXX.c)
+    echo "$code" > "$tmpf"
+    result=$($CC $flags -o /dev/null "$tmpf" 2>/dev/null && echo yes || echo no)
+    rm -f "$tmpf"
+    echo "$result"
+}
+
+# Helper: try pkg-config
+try_pkg() {
+    local pkg="$1"
+    if [ "$HAS_PKGCONFIG" = "yes" ] && pkg-config --exists "$pkg" 2>/dev/null; then
+        echo yes
+    else
+        echo no
+    fi
+}
+
+# Initialize flags
+CFLAGS="-std=c11 -Wall -Wextra -Wpedantic"
+LDFLAGS=""
+LIBS=""
+DEFINES=""
+
+# Platform-specific flags
+case "$PLATFORM" in
+    darwin)
+        DEFINES="$DEFINES -DRI_DARWIN"
+        CFLAGS="$CFLAGS -D_DARWIN_C_SOURCE"
+        ;;
+    linux)
+        DEFINES="$DEFINES -DRI_LINUX"
+        CFLAGS="$CFLAGS -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE"
+        LIBS="$LIBS -lm"
+        ;;
+esac
+
+# Probe ncurses
+FOUND_NCURSES=no
+if [ "$WITH_NCURSES" != "no" ]; then
+    if [ "$(try_pkg ncursesw)" = "yes" ]; then
+        FOUND_NCURSES=yes
+        NCURSES_CFLAGS=$(pkg-config --cflags ncursesw)
+        NCURSES_LIBS=$(pkg-config --libs ncursesw)
+    elif [ "$(try_pkg ncurses)" = "yes" ]; then
+        FOUND_NCURSES=yes
+        NCURSES_CFLAGS=$(pkg-config --cflags ncurses)
+        NCURSES_LIBS=$(pkg-config --libs ncurses)
+    else
+        # Try direct link
+        result=$(try_compile '#include <curses.h>
+int main(void){initscr();return 0;}' "-lncurses")
+        if [ "$result" = "yes" ]; then
+            FOUND_NCURSES=yes
+            NCURSES_CFLAGS=""
+            NCURSES_LIBS="-lncurses"
+        fi
+    fi
+fi
+if [ "$FOUND_NCURSES" = "yes" ]; then
+    DEFINES="$DEFINES -DHAVE_NCURSES"
+    CFLAGS="$CFLAGS $NCURSES_CFLAGS"
+    LIBS="$LIBS $NCURSES_LIBS"
+fi
+echo "  ncurses: $FOUND_NCURSES"
+
+# Probe cairo
+FOUND_CAIRO=no
+if [ "$WITH_CAIRO" != "no" ]; then
+    if [ "$(try_pkg cairo)" = "yes" ]; then
+        FOUND_CAIRO=yes
+        CAIRO_CFLAGS=$(pkg-config --cflags cairo)
+        CAIRO_LIBS=$(pkg-config --libs cairo)
+        DEFINES="$DEFINES -DHAVE_CAIRO"
+        CFLAGS="$CFLAGS $CAIRO_CFLAGS"
+        LIBS="$LIBS $CAIRO_LIBS"
+    fi
+fi
+echo "  cairo: $FOUND_CAIRO"
+
+# Probe libpng
+FOUND_LIBPNG=no
+if [ "$WITH_LIBPNG" != "no" ]; then
+    if [ "$(try_pkg libpng)" = "yes" ]; then
+        FOUND_LIBPNG=yes
+        LIBPNG_CFLAGS=$(pkg-config --cflags libpng)
+        LIBPNG_LIBS=$(pkg-config --libs libpng)
+        DEFINES="$DEFINES -DHAVE_LIBPNG"
+        CFLAGS="$CFLAGS $LIBPNG_CFLAGS"
+        LIBS="$LIBS $LIBPNG_LIBS"
+    fi
+fi
+echo "  libpng: $FOUND_LIBPNG"
+
+# Probe FFmpeg (libavcodec, libavformat, libswscale)
+FOUND_FFMPEG=no
+if [ "$WITH_FFMPEG" != "no" ]; then
+    if [ "$(try_pkg libavcodec)" = "yes" ] && \
+       [ "$(try_pkg libavformat)" = "yes" ] && \
+       [ "$(try_pkg libswscale)" = "yes" ] && \
+       [ "$(try_pkg libavutil)" = "yes" ]; then
+        FOUND_FFMPEG=yes
+        FFMPEG_CFLAGS="$(pkg-config --cflags libavcodec libavformat libswscale libavutil)"
+        FFMPEG_LIBS="$(pkg-config --libs libavcodec libavformat libswscale libavutil)"
+        DEFINES="$DEFINES -DHAVE_FFMPEG"
+        CFLAGS="$CFLAGS $FFMPEG_CFLAGS"
+        LIBS="$LIBS $FFMPEG_LIBS"
+    fi
+fi
+echo "  ffmpeg: $FOUND_FFMPEG"
+
+# Probe dns_sd (macOS)
+FOUND_DNS_SD=no
+if [ "$WITH_DNS_SD" != "no" ] && [ "$PLATFORM" = "darwin" ]; then
+    result=$(try_compile '#include <dns_sd.h>
+int main(void){DNSServiceRef r;(void)r;return 0;}' "")
+    if [ "$result" = "yes" ]; then
+        FOUND_DNS_SD=yes
+        DEFINES="$DEFINES -DHAVE_DNS_SD"
+    fi
+fi
+echo "  dns_sd: $FOUND_DNS_SD"
+
+# Probe avahi (Linux)
+FOUND_AVAHI=no
+if [ "$WITH_AVAHI" != "no" ] && [ "$PLATFORM" = "linux" ]; then
+    if [ "$(try_pkg avahi-client)" = "yes" ]; then
+        FOUND_AVAHI=yes
+        AVAHI_CFLAGS=$(pkg-config --cflags avahi-client)
+        AVAHI_LIBS=$(pkg-config --libs avahi-client)
+        DEFINES="$DEFINES -DHAVE_AVAHI"
+        CFLAGS="$CFLAGS $AVAHI_CFLAGS"
+        LIBS="$LIBS $AVAHI_LIBS"
+    fi
+fi
+echo "  avahi: $FOUND_AVAHI"
+
+# Generate config.h
+echo "Generating config.h..."
+cat > config.h <<EOF
+/* config.h - Generated by configure. Do not edit. */
+#ifndef RI_CONFIG_H
+#define RI_CONFIG_H
+
+/* Platform */
+EOF
+
+[ "$PLATFORM" = "darwin" ] && echo "#define RI_DARWIN 1" >> config.h
+[ "$PLATFORM" = "linux" ]  && echo "#define RI_LINUX 1"  >> config.h
+
+cat >> config.h <<EOF
+
+/* Optional features */
+EOF
+
+[ "$FOUND_NCURSES" = "yes" ] && echo "#define HAVE_NCURSES 1" >> config.h
+[ "$FOUND_CAIRO" = "yes" ]   && echo "#define HAVE_CAIRO 1"   >> config.h
+[ "$FOUND_FFMPEG" = "yes" ]  && echo "#define HAVE_FFMPEG 1"  >> config.h
+[ "$FOUND_DNS_SD" = "yes" ]  && echo "#define HAVE_DNS_SD 1"  >> config.h
+[ "$FOUND_AVAHI" = "yes" ]   && echo "#define HAVE_AVAHI 1"   >> config.h
+[ "$FOUND_LIBPNG" = "yes" ]  && echo "#define HAVE_LIBPNG 1"  >> config.h
+
+cat >> config.h <<EOF
+
+/* Version */
+#define RI_VERSION "0.1.0"
+
+#endif /* RI_CONFIG_H */
+EOF
+
+# Generate config.mk
+echo "Generating config.mk..."
+cat > config.mk <<EOF
+# config.mk - Generated by configure. Do not edit.
+CC = $CC
+PREFIX = $PREFIX
+PLATFORM = $PLATFORM
+CFLAGS = $CFLAGS $DEFINES
+LDFLAGS = $LDFLAGS
+LIBS = $LIBS
+FOUND_NCURSES = $FOUND_NCURSES
+FOUND_CAIRO = $FOUND_CAIRO
+FOUND_FFMPEG = $FOUND_FFMPEG
+FOUND_DNS_SD = $FOUND_DNS_SD
+FOUND_AVAHI = $FOUND_AVAHI
+FOUND_LIBPNG = $FOUND_LIBPNG
+EOF
+
+echo ""
+echo "Configuration complete. Run 'make' to build."
