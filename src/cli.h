@@ -22,6 +22,7 @@ typedef struct {
     int              no_arp;
     int              subnet_scan;
     int              hop_scan;
+    int              web_mode;
     int              has_target;
 } ri_config_t;
 

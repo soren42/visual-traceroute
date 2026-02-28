@@ -5,6 +5,7 @@
 #include "core/graph.h"
 #include "output/out_json.h"
 #include "output/out_html.h"
+#include "output/out_web.h"
 #include "output/layout.h"
 
 #ifdef HAVE_NCURSES
@@ -32,6 +33,9 @@ int main(int argc, char **argv)
     LOG_INFO("visual-traceroute %s starting", RI_VERSION);
     LOG_DEBUG("Verbosity: %d, Output flags: 0x%x", cfg.verbosity,
               cfg.output_flags);
+
+    if (cfg.web_mode)
+        return ri_web_serve(&cfg);
 
     /* Run discovery */
     ri_graph_t *g = ri_scan_run(&cfg);

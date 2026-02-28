@@ -7,4 +7,8 @@
    Returns 0 on success. */
 int ri_out_html(const ri_graph_t *g, const char *filename);
 
+/* Same as ri_out_html but returns a malloc'd HTML string (caller frees).
+   Returns NULL on error. */
+char *ri_out_html_string(const ri_graph_t *g);
+
 #endif /* RI_OUT_HTML_H */

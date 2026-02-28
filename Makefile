@@ -20,6 +20,7 @@ CORE_SRC = \
 	src/net/icmp6.c \
 	src/output/out_json.c \
 	src/output/out_html.c \
+	src/output/out_web.c \
 	src/output/layout.c \
 	src/util/alloc.c \
 	src/util/strutil.c \
