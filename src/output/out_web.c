@@ -264,7 +264,7 @@ int ri_web_serve(const ri_config_t *defaults)
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = 0; /* OS-assigned */
 
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -283,15 +283,19 @@ int ri_web_serve(const ri_config_t *defaults)
         return 1;
     }
 
-    printf("visual-traceroute web UI: http://127.0.0.1:%d/\n", port);
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) != 0)
+        strncpy(hostname, "localhost", sizeof(hostname));
+
+    printf("visual-traceroute web UI: http://%s:%d/\n", hostname, port);
     fflush(stdout);
 
     /* Auto-open browser */
-    char cmd[128];
+    char cmd[512];
 #ifdef RI_DARWIN
-    snprintf(cmd, sizeof(cmd), "open http://127.0.0.1:%d/ 2>/dev/null &", port);
+    snprintf(cmd, sizeof(cmd), "open http://%s:%d/ 2>/dev/null &", hostname, port);
 #else
-    snprintf(cmd, sizeof(cmd), "xdg-open http://127.0.0.1:%d/ 2>/dev/null &", port);
+    snprintf(cmd, sizeof(cmd), "xdg-open http://%s:%d/ 2>/dev/null &", hostname, port);
 #endif
     (void)system(cmd);
 
