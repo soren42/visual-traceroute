@@ -84,7 +84,7 @@ int ri_scan_name_resolution(ri_graph_t *g, const ri_config_t *cfg)
 {
     LOG_INFO("Phase 4: Name resolution");
 
-    int n = ri_dns_resolve_all(g);
+    int n = ri_dns_resolve_all(g, cfg->nameserver);
     if (n < 0) {
         LOG_WARN("DNS resolution errors");
     } else {

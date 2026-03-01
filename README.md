@@ -85,6 +85,7 @@ Usage: visual-traceroute [OPTIONS]
   --no-arp             Disable ARP cache reading
   --subnet-scan        Ping sweep local subnets
   --hop-scan           Probe /24 around each traceroute hop
+  -n, --nameserver IP  Use custom DNS server for reverse lookups
   -h, --help           Show help
   --version            Show version
 ```

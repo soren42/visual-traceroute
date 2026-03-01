@@ -21,6 +21,9 @@ sudo visual-traceroute -t 8.8.8.8 -o json,curses,png,html -f network
 
 # Traceroute with hop scanning (discover neighbors at each router)
 sudo visual-traceroute -t 8.8.8.8 -d 5 --hop-scan -vvv -o json,html -f hopscan
+
+# Use an intranet DNS server for reverse lookups
+sudo visual-traceroute -n 10.0.0.1 -vv -o json,html -f intranet
 ```
 
 ## Command-Line Options
@@ -39,6 +42,7 @@ Usage: visual-traceroute [OPTIONS]
   --no-arp             Disable ARP cache reading
   --subnet-scan        Enable ping sweep of local subnets
   --hop-scan           Probe /24 around each traceroute hop
+  -n, --nameserver IP  Use custom DNS server for reverse lookups
   -h, --help           Show help
   --version            Show version
 ```

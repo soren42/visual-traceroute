@@ -90,6 +90,24 @@ static void test_cli_ipv4_only(void)
     TEST_ASSERT(!cfg.ipv6_only, "ipv6 only not set");
 }
 
+static void test_cli_nameserver(void)
+{
+    ri_config_t cfg;
+    char *argv[] = {"prog", "-n", "10.0.0.1"};
+    int rc = ri_cli_parse(&cfg, 3, argv);
+    TEST_ASSERT_EQ(rc, 0, "parse nameserver ok");
+    TEST_ASSERT_STR(cfg.nameserver, "10.0.0.1", "nameserver value");
+}
+
+static void test_cli_nameserver_long(void)
+{
+    ri_config_t cfg;
+    char *argv[] = {"prog", "--nameserver", "192.168.1.53"};
+    int rc = ri_cli_parse(&cfg, 3, argv);
+    TEST_ASSERT_EQ(rc, 0, "parse --nameserver ok");
+    TEST_ASSERT_STR(cfg.nameserver, "192.168.1.53", "nameserver long value");
+}
+
 static void test_cli_combined(void)
 {
     ri_config_t cfg;
@@ -115,5 +133,7 @@ void test_cli_suite(void)
     test_cli_depth();
     test_cli_file();
     test_cli_ipv4_only();
+    test_cli_nameserver();
+    test_cli_nameserver_long();
     test_cli_combined();
 }

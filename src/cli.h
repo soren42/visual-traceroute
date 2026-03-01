@@ -24,6 +24,7 @@ typedef struct {
     int              hop_scan;
     int              web_mode;
     int              has_target;
+    char             nameserver[64];
 } ri_config_t;
 
 /* Parse command-line arguments into config. Returns 0 on success, -1 on error. */
