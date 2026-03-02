@@ -11,19 +11,47 @@
 #include "util/alloc.h"
 #include "util/strutil.h"
 
+#include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <arpa/inet.h>
+
+/* ---------- progress callback ------------------------------------------ */
+
+static ri_progress_fn g_progress_fn;
+static void          *g_progress_ctx;
+
+void ri_scan_set_progress(ri_progress_fn fn, void *ctx)
+{
+    g_progress_fn  = fn;
+    g_progress_ctx = ctx;
+}
+
+static void scan_progress(const char *fmt, ...)
+{
+    if (!g_progress_fn) return;
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    g_progress_fn(buf, g_progress_ctx);
+}
+
+/* ----------------------------------------------------------------------- */
 
 int ri_scan_local_interfaces(ri_graph_t *g, const ri_config_t *cfg)
 {
     (void)cfg;
     LOG_INFO("Phase 1: Local host identification");
+    scan_progress("Enumerating local interfaces...");
     int n = ri_iface_enumerate(g);
     if (n < 0) {
         LOG_ERROR("Failed to enumerate network interfaces");
         return -1;
     }
     LOG_INFO("Phase 1: discovered %d local interface(s)", n);
+    scan_progress("Found %d local interface(s)", n);
     return n;
 }
 
@@ -31,18 +59,21 @@ int ri_scan_routing_table(ri_graph_t *g, const ri_config_t *cfg)
 {
     (void)cfg;
     LOG_INFO("Phase 2: Routing table analysis");
+    scan_progress("Reading routing table...");
     int n = ri_route_read(g);
     if (n < 0) {
         LOG_WARN("Failed to read routing table");
         return -1;
     }
     LOG_INFO("Phase 2: discovered %d route(s)", n);
+    scan_progress("Found %d route(s)", n);
     return n;
 }
 
 int ri_scan_lan_discovery(ri_graph_t *g, const ri_config_t *cfg)
 {
     LOG_INFO("Phase 3: LAN discovery");
+    scan_progress("LAN discovery...");
 
     if (!cfg->no_arp) {
         int n = ri_arp_read(g);
@@ -50,11 +81,13 @@ int ri_scan_lan_discovery(ri_graph_t *g, const ri_config_t *cfg)
             LOG_WARN("Failed to read ARP cache");
         } else {
             LOG_INFO("Phase 3: %d ARP cache entries", n);
+            scan_progress("ARP cache: %d entries", n);
         }
     }
 
     if (cfg->subnet_scan) {
         LOG_INFO("Phase 3: active subnet scan");
+        scan_progress("Subnet ping sweep (this may take a while)...");
         for (int i = 0; i < g->host_count; i++) {
             ri_host_t *h = &g->hosts[i];
             if (h->type != RI_HOST_LOCAL) continue;
@@ -63,15 +96,20 @@ int ri_scan_lan_discovery(ri_graph_t *g, const ri_config_t *cfg)
                 struct in_addr base;
                 base.s_addr = h->ipv4.s_addr & htonl(0xFFFFFF00);
                 int n = ri_ping_sweep(g, base, 24, RI_PING_TIMEOUT_MS);
-                if (n > 0)
+                if (n > 0) {
                     LOG_INFO("Subnet scan: %d hosts on %s", n, h->iface_name);
+                    scan_progress("Subnet scan: %d hosts on %s", n, h->iface_name);
+                }
             }
             /* Scan secondary IPv4 subnets */
             for (int j = 0; j < h->ipv4_count; j++) {
                 struct in_addr base;
                 base.s_addr = h->ipv4_addrs[j].s_addr & htonl(0xFFFFFF00);
                 int n = ri_ping_sweep(g, base, 24, RI_PING_TIMEOUT_MS);
-                if (n > 0) LOG_INFO("Subnet scan: %d hosts", n);
+                if (n > 0) {
+                    LOG_INFO("Subnet scan: %d hosts", n);
+                    scan_progress("Subnet scan: %d more hosts", n);
+                }
             }
         }
     }
@@ -83,21 +121,25 @@ int ri_scan_lan_discovery(ri_graph_t *g, const ri_config_t *cfg)
 int ri_scan_name_resolution(ri_graph_t *g, const ri_config_t *cfg)
 {
     LOG_INFO("Phase 4: Name resolution");
+    scan_progress("Resolving hostnames...");
 
     int n = ri_dns_resolve_all(g, cfg->nameserver);
     if (n < 0) {
         LOG_WARN("DNS resolution errors");
     } else {
         LOG_INFO("Phase 4: resolved %d hostname(s)", n);
+        scan_progress("Resolved %d hostname(s)", n);
     }
 
     if (!cfg->no_mdns) {
         LOG_INFO("Phase 4: mDNS browse (3s timeout)");
+        scan_progress("mDNS discovery (3s)...");
         int m = ri_mdns_browse(g, 3000);
         if (m < 0) {
             LOG_WARN("mDNS discovery failed");
         } else {
             LOG_INFO("Phase 4: %d mDNS name(s)", m);
+            scan_progress("mDNS: %d name(s)", m);
         }
     }
 
@@ -109,10 +151,12 @@ int ri_scan_traceroute(ri_graph_t *g, const ri_config_t *cfg)
 {
     if (!cfg->has_target) {
         LOG_INFO("Phase 5: skipped (no target)");
+        scan_progress("Traceroute: skipped (no target)");
         return 0;
     }
 
     LOG_INFO("Phase 5: Traceroute to %s", cfg->target);
+    scan_progress("Traceroute to %s...", cfg->target);
 
     struct in_addr target_addr;
     if (inet_pton(AF_INET, cfg->target, &target_addr) != 1) {
@@ -160,6 +204,8 @@ int ri_scan_traceroute(ri_graph_t *g, const ri_config_t *cfg)
 
         LOG_DEBUG("TTL %d: %s (%.1f ms)", ttl,
                   ri_host_ipv4_str(&g->hosts[hop_id]), rtt);
+        scan_progress("TTL %d: %s (%.1f ms)", ttl,
+                      ri_host_ipv4_str(&g->hosts[hop_id]), rtt);
 
         /* Add edge from previous hop */
         if (prev_id >= 0 && !ri_graph_has_edge(g, prev_id, hop_id)) {
@@ -174,6 +220,9 @@ int ri_scan_traceroute(ri_graph_t *g, const ri_config_t *cfg)
             LOG_INFO("Hop scan: probing %d.%d.%d.0/24",
                      (hop_net >> 24) & 0xFF, (hop_net >> 16) & 0xFF,
                      (hop_net >> 8) & 0xFF);
+            scan_progress("Hop scan: probing %d.%d.%d.0/24...",
+                          (hop_net >> 24) & 0xFF, (hop_net >> 16) & 0xFF,
+                          (hop_net >> 8) & 0xFF);
             for (uint32_t h = 1; h < 255; h++) {
                 struct in_addr probe;
                 probe.s_addr = htonl(hop_net | h);
@@ -198,8 +247,10 @@ int ri_scan_traceroute(ri_graph_t *g, const ri_config_t *cfg)
                 inet_ntop(AF_INET, &probe, abuf, sizeof(abuf));
                 LOG_DEBUG("Hop scan: found %s (%.1f ms)", abuf, probe_rtt);
             }
-            if (scan_count > 0)
+            if (scan_count > 0) {
                 LOG_INFO("Hop scan: %d neighbor(s) at TTL %d", scan_count, ttl);
+                scan_progress("Hop scan: %d neighbor(s) at TTL %d", scan_count, ttl);
+            }
         }
 
         /* Check if reached target */
@@ -231,10 +282,12 @@ int ri_scan_ipv6_augment(ri_graph_t *g, const ri_config_t *cfg)
 {
     if (cfg->ipv4_only) {
         LOG_INFO("Phase 6: skipped (IPv4-only mode)");
+        scan_progress("IPv6 discovery: skipped (IPv4-only)");
         return 0;
     }
 
     LOG_INFO("Phase 6: IPv6 neighbor discovery");
+    scan_progress("IPv6 neighbor discovery...");
     int total = 0;
 
     for (int i = 0; i < g->host_count; i++) {
@@ -258,6 +311,7 @@ int ri_scan_ipv6_augment(ri_graph_t *g, const ri_config_t *cfg)
     }
 
     LOG_INFO("Phase 6: %d total IPv6 neighbor(s)", total);
+    scan_progress("IPv6: %d neighbor(s)", total);
     return total;
 }
 
@@ -295,5 +349,7 @@ ri_graph_t *ri_scan_run(const ri_config_t *cfg)
 
     LOG_INFO("Discovery complete: %d hosts, %d edges",
              g->host_count, g->edge_count);
+    scan_progress("Discovery complete: %d hosts, %d edges",
+                  g->host_count, g->edge_count);
     return g;
 }

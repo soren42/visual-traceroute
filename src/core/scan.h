@@ -4,6 +4,12 @@
 #include "core/graph.h"
 #include "cli.h"
 
+/* Progress callback — called with a human-readable status message. */
+typedef void (*ri_progress_fn)(const char *msg, void *ctx);
+
+/* Set (or clear) the progress callback. Thread-unsafe by design. */
+void ri_scan_set_progress(ri_progress_fn fn, void *ctx);
+
 /* Run the full discovery engine. Returns populated graph. */
 ri_graph_t *ri_scan_run(const ri_config_t *cfg);
 
