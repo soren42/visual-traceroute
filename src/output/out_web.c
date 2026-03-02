@@ -283,19 +283,42 @@ int ri_web_serve(const ri_config_t *defaults)
         return 1;
     }
 
-    char hostname[256];
-    if (gethostname(hostname, sizeof(hostname)) != 0)
-        strncpy(hostname, "localhost", sizeof(hostname));
+    char host[256];
+    if (defaults->use_ip) {
+        /* Detect primary non-loopback IP via UDP connect trick */
+        int probe = socket(AF_INET, SOCK_DGRAM, 0);
+        if (probe >= 0) {
+            struct sockaddr_in remote;
+            memset(&remote, 0, sizeof(remote));
+            remote.sin_family = AF_INET;
+            remote.sin_port = htons(53);
+            inet_pton(AF_INET, "8.8.8.8", &remote.sin_addr);
+            if (connect(probe, (struct sockaddr *)&remote, sizeof(remote)) == 0) {
+                struct sockaddr_in local;
+                socklen_t llen = sizeof(local);
+                getsockname(probe, (struct sockaddr *)&local, &llen);
+                inet_ntop(AF_INET, &local.sin_addr, host, sizeof(host));
+            } else {
+                strncpy(host, "127.0.0.1", sizeof(host));
+            }
+            close(probe);
+        } else {
+            strncpy(host, "127.0.0.1", sizeof(host));
+        }
+    } else {
+        if (gethostname(host, sizeof(host)) != 0)
+            strncpy(host, "localhost", sizeof(host));
+    }
 
-    printf("visual-traceroute web UI: http://%s:%d/\n", hostname, port);
+    printf("visual-traceroute web UI: http://%s:%d/\n", host, port);
     fflush(stdout);
 
     /* Auto-open browser */
     char cmd[512];
 #ifdef RI_DARWIN
-    snprintf(cmd, sizeof(cmd), "open http://%s:%d/ 2>/dev/null &", hostname, port);
+    snprintf(cmd, sizeof(cmd), "open http://%s:%d/ 2>/dev/null &", host, port);
 #else
-    snprintf(cmd, sizeof(cmd), "xdg-open http://%s:%d/ 2>/dev/null &", hostname, port);
+    snprintf(cmd, sizeof(cmd), "xdg-open http://%s:%d/ 2>/dev/null &", host, port);
 #endif
     (void)system(cmd);
 

@@ -99,6 +99,16 @@ static void test_cli_nameserver(void)
     TEST_ASSERT_STR(cfg.nameserver, "10.0.0.1", "nameserver value");
 }
 
+static void test_cli_use_ip(void)
+{
+    ri_config_t cfg;
+    char *argv[] = {"prog", "-i", "-w"};
+    int rc = ri_cli_parse(&cfg, 3, argv);
+    TEST_ASSERT_EQ(rc, 0, "parse -i ok");
+    TEST_ASSERT(cfg.use_ip, "use_ip set");
+    TEST_ASSERT(cfg.web_mode, "web_mode set");
+}
+
 static void test_cli_nameserver_long(void)
 {
     ri_config_t cfg;
@@ -135,5 +145,6 @@ void test_cli_suite(void)
     test_cli_ipv4_only();
     test_cli_nameserver();
     test_cli_nameserver_long();
+    test_cli_use_ip();
     test_cli_combined();
 }

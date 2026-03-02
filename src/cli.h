@@ -24,6 +24,7 @@ typedef struct {
     int              hop_scan;
     int              web_mode;
     int              has_target;
+    int              use_ip;
     char             nameserver[64];
 } ri_config_t;
 

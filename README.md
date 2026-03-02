@@ -86,6 +86,7 @@ Usage: visual-traceroute [OPTIONS]
   --subnet-scan        Ping sweep local subnets
   --hop-scan           Probe /24 around each traceroute hop
   -n, --nameserver IP  Use custom DNS server for reverse lookups
+  -i, --ip             Use IP address instead of hostname in web UI URLs
   -h, --help           Show help
   --version            Show version
 ```

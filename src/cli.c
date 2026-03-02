@@ -58,6 +58,7 @@ void ri_cli_usage(const char *prog)
         "  --subnet-scan        Enable ping sweep of local subnets\n"
         "  --hop-scan           Probe /24 around each traceroute hop\n"
         "  -n, --nameserver IP  Use custom DNS server for reverse lookups\n"
+        "  -i, --ip             Use IP address instead of hostname in web UI URLs\n"
         "  -w, --web            Start local web UI for browser-based scans\n"
         "  -h, --help           Show this help\n"
         "  --version            Show version\n"
@@ -78,6 +79,7 @@ int ri_cli_parse(ri_config_t *cfg, int argc, char **argv)
         {"subnet-scan", no_argument,       NULL, 'S'},
         {"hop-scan",    no_argument,       NULL, 'H'},
         {"nameserver",  required_argument, NULL, 'n'},
+        {"ip",          no_argument,       NULL, 'i'},
         {"web",         no_argument,       NULL, 'w'},
         {"help",        no_argument,       NULL, 'h'},
         {"version",     no_argument,       NULL, 'V'},
@@ -90,7 +92,7 @@ int ri_cli_parse(ri_config_t *cfg, int argc, char **argv)
     /* Reset getopt for testability */
     optind = 1;
 
-    while ((opt = getopt_long(argc, argv, "t:d:vo:f:n:46wh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:d:vo:f:n:i46wh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 't':
             strncpy(cfg->target, optarg, sizeof(cfg->target) - 1);
@@ -134,6 +136,9 @@ int ri_cli_parse(ri_config_t *cfg, int argc, char **argv)
             break;
         case 'n':
             strncpy(cfg->nameserver, optarg, sizeof(cfg->nameserver) - 1);
+            break;
+        case 'i':
+            cfg->use_ip = 1;
             break;
         case 'w':
             cfg->web_mode = 1;
