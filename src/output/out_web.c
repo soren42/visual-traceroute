@@ -13,6 +13,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <dirent.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -41,6 +44,15 @@ static void sigint_handler(int sig)
 {
     (void)sig;
     g_shutdown = 1;
+}
+
+/* ---------- scan ID counter -------------------------------------------- */
+
+static unsigned int g_scan_counter;
+
+static void make_scan_id(char *buf, size_t len)
+{
+    snprintf(buf, len, "%08x", g_scan_counter++);
 }
 
 /* ---------- helpers ----------------------------------------------------- */
@@ -116,59 +128,165 @@ static void send_error(int fd, const char *status, const char *msg)
     send_response(fd, status, "text/plain", msg, strlen(msg));
 }
 
-/* ---------- chunked transfer helpers ----------------------------------- */
-
-static void send_chunk(int fd, const char *data, size_t len)
+static void send_redirect(int fd, const char *location)
 {
-    if (len == 0) return;
-    char hdr[32];
-    int hlen = snprintf(hdr, sizeof(hdr), "%zx\r\n", len);
+    char hdr[512];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 303 See Other\r\n"
+        "Location: %s\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n", location);
     write(fd, hdr, (size_t)hlen);
-    write(fd, data, len);
-    write(fd, "\r\n", 2);
 }
 
-static void send_chunk_str(int fd, const char *str)
+/* ---------- file-based progress callback ------------------------------- */
+
+static void file_progress_cb(const char *msg, void *ctx)
 {
-    send_chunk(fd, str, strlen(str));
-}
-
-static void send_chunked_end(int fd)
-{
-    write(fd, "0\r\n\r\n", 5);
-}
-
-/* ---------- base64 encoder --------------------------------------------- */
-
-static char *base64_encode(const unsigned char *data, size_t len)
-{
-    static const char tbl[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    size_t out_len = 4 * ((len + 2) / 3);
-    char *out = malloc(out_len + 1);
-    if (!out) return NULL;
-
-    size_t i, j;
-    for (i = 0, j = 0; i + 2 < len; i += 3, j += 4) {
-        unsigned int v = ((unsigned int)data[i] << 16) |
-                         ((unsigned int)data[i+1] << 8) |
-                          (unsigned int)data[i+2];
-        out[j]   = tbl[(v >> 18) & 0x3F];
-        out[j+1] = tbl[(v >> 12) & 0x3F];
-        out[j+2] = tbl[(v >>  6) & 0x3F];
-        out[j+3] = tbl[ v        & 0x3F];
+    const char *log_path = (const char *)ctx;
+    FILE *f = fopen(log_path, "a");
+    if (f) {
+        fprintf(f, "%s\n", msg);
+        fclose(f);
     }
-    if (i < len) {
-        unsigned int v = (unsigned int)data[i] << 16;
-        if (i + 1 < len) v |= (unsigned int)data[i+1] << 8;
-        out[j]   = tbl[(v >> 18) & 0x3F];
-        out[j+1] = tbl[(v >> 12) & 0x3F];
-        out[j+2] = (i + 1 < len) ? tbl[(v >> 6) & 0x3F] : '=';
-        out[j+3] = '=';
-        j += 4;
+}
+
+/* ---------- child scan process ----------------------------------------- */
+
+static void run_scan_child(const ri_config_t *cfg, const char *scan_dir,
+                           int listen_fd)
+{
+    close(listen_fd);
+
+    char log_path[512];
+    snprintf(log_path, sizeof(log_path), "%s/progress.log", scan_dir);
+
+    char result_path[512];
+    snprintf(result_path, sizeof(result_path), "%s/result.html", scan_dir);
+
+    char done_path[512];
+    snprintf(done_path, sizeof(done_path), "%s/done", scan_dir);
+
+    char error_path[512];
+    snprintf(error_path, sizeof(error_path), "%s/error", scan_dir);
+
+    ri_scan_set_progress(file_progress_cb, log_path);
+
+    ri_graph_t *g = ri_scan_run(cfg);
+    if (!g) {
+        FILE *f = fopen(error_path, "w");
+        if (f) { fprintf(f, "Scan failed\n"); fclose(f); }
+        ri_scan_set_progress(NULL, NULL);
+        _exit(1);
     }
-    out[j] = '\0';
-    return out;
+
+    file_progress_cb("Computing MST...", log_path);
+    ri_graph_kruskal_mst(g);
+
+    file_progress_cb("Computing 3D layout...", log_path);
+    ri_layout_3d(g);
+    ri_layout_force_refine(g, 50);
+
+    file_progress_cb("Generating visualization...", log_path);
+    int rc = ri_out_html(g, result_path);
+    ri_graph_destroy(g);
+
+    if (rc != 0) {
+        FILE *f = fopen(error_path, "w");
+        if (f) { fprintf(f, "HTML generation failed\n"); fclose(f); }
+        ri_scan_set_progress(NULL, NULL);
+        _exit(1);
+    }
+
+    /* Write done sentinel */
+    FILE *f = fopen(done_path, "w");
+    if (f) { fprintf(f, "done\n"); fclose(f); }
+
+    ri_scan_set_progress(NULL, NULL);
+    _exit(0);
+}
+
+/* ---------- progress page builder -------------------------------------- */
+
+static char *build_progress_page(const char *scan_id)
+{
+    const char *fmt =
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>Scanning... - visual-traceroute</title>"
+        "<style>"
+        "body{margin:0;background:#0a0a14;color:#e0e0e0;font-family:system-ui,sans-serif;"
+        "display:flex;justify-content:center;align-items:center;min-height:100vh}"
+        ".card{background:#16162a;border:1px solid #2a2a4a;border-radius:12px;"
+        "padding:32px 36px;width:420px;box-shadow:0 8px 32px rgba(0,0,0,0.5);"
+        "text-align:center}"
+        "h1{margin:0 0 6px;font-size:22px;color:#fff}"
+        ".sub{font-size:13px;color:#888;margin-bottom:20px}"
+        "@keyframes spin{to{transform:rotate(360deg)}}"
+        ".spinner{width:40px;height:40px;margin:0 auto 16px;border:3px solid #2a2a4a;"
+        "border-top-color:#5577ff;border-radius:50%%;animation:spin 0.8s linear infinite}"
+        "#status{font-size:14px;color:#aac;margin-bottom:12px;min-height:20px}"
+        "#log{text-align:left;background:#0d0d1a;border:1px solid #2a2a4a;"
+        "border-radius:8px;padding:10px 12px;max-height:240px;overflow-y:auto;"
+        "font-size:12px;font-family:'SF Mono',Menlo,Consolas,monospace;"
+        "line-height:1.6;color:#8a8aaa}"
+        "</style></head><body>"
+        "<div class=\"card\">"
+        "<h1>Scanning...</h1>"
+        "<div class=\"sub\">Network Discovery &amp; 3D Visualization</div>"
+        "<div class=\"spinner\" id=\"spinner\"></div>"
+        "<div id=\"status\">Initializing...</div>"
+        "<div id=\"log\"></div>"
+        "</div>"
+        "<script>"
+        "var sid='%s',seen=0;"
+        "function poll(){"
+        "fetch('/api/status/'+sid).then(function(r){return r.json();})"
+        ".then(function(d){"
+        "var log=document.getElementById('log');"
+        "for(var i=seen;i<d.lines.length;i++){"
+        "log.innerHTML+='<div>'+d.lines[i].replace(/</g,'&lt;')+'</div>';}"
+        "seen=d.lines.length;"
+        "log.scrollTop=log.scrollHeight;"
+        "if(d.lines.length>0)document.getElementById('status').textContent=d.lines[d.lines.length-1];"
+        "if(d.status==='done'){window.location='/result/'+sid;return;}"
+        "if(d.status==='error'){document.getElementById('status').textContent='Scan failed!';"
+        "document.getElementById('spinner').style.display='none';return;}"
+        "setTimeout(poll,2000);"
+        "}).catch(function(){setTimeout(poll,3000);});}"
+        "poll();"
+        "</script></body></html>";
+
+    size_t len = strlen(fmt) + 32;
+    char *page = malloc(len);
+    if (page)
+        snprintf(page, len, fmt, scan_id);
+    return page;
+}
+
+/* ---------- temp dir cleanup ------------------------------------------- */
+
+static void cleanup_temp_dirs(void)
+{
+    DIR *d = opendir("/tmp");
+    if (!d) return;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strncmp(ent->d_name, "vt-", 3) != 0) continue;
+        char path[512];
+        /* Remove known files inside the scan directory */
+        const char *files[] = {
+            "progress.log", "result.html", "done", "error"
+        };
+        for (int i = 0; i < 4; i++) {
+            snprintf(path, sizeof(path), "/tmp/%s/%s", ent->d_name, files[i]);
+            unlink(path);
+        }
+        snprintf(path, sizeof(path), "/tmp/%s", ent->d_name);
+        rmdir(path);
+    }
+    closedir(d);
 }
 
 /* ---------- form page --------------------------------------------------- */
@@ -200,7 +318,7 @@ static const char FORM_PAGE[] =
 "button:hover{background:#6688ff}"
 ".foot{text-align:center;margin-top:14px;font-size:11px;color:#555}"
 "</style></head><body>"
-"<form class=\"card\" action=\"/scan\" method=\"POST\" target=\"_blank\">"
+"<form class=\"card\" action=\"/scan\" method=\"POST\">"
 "<h1>visual-traceroute</h1>"
 "<div class=\"sub\">Network Discovery &amp; 3D Visualization</div>"
 "<label for=\"target\">Target host (blank for local-only scan)</label>"
@@ -220,84 +338,12 @@ static const char FORM_PAGE[] =
 "<label><input type=\"checkbox\" name=\"hop_scan\"> Hop scan</label>"
 "</div>"
 "<button type=\"submit\">Scan &amp; Visualize</button>"
-"<div class=\"foot\">Result opens in a new tab. Ctrl-C in terminal to stop.</div>"
+"<div class=\"foot\">Ctrl-C in terminal to stop server.</div>"
 "</form></body></html>";
-
-/* ---------- progress page (streamed as first chunk) -------------------- */
-
-static const char PROGRESS_PAGE[] =
-"<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-"<title>Scanning... - visual-traceroute</title>"
-"<style>"
-"body{margin:0;background:#0a0a14;color:#e0e0e0;font-family:system-ui,sans-serif;"
-"display:flex;justify-content:center;align-items:center;min-height:100vh}"
-".card{background:#16162a;border:1px solid #2a2a4a;border-radius:12px;"
-"padding:32px 36px;width:420px;box-shadow:0 8px 32px rgba(0,0,0,0.5);"
-"text-align:center}"
-"h1{margin:0 0 6px;font-size:22px;color:#fff}"
-".sub{font-size:13px;color:#888;margin-bottom:20px}"
-"@keyframes spin{to{transform:rotate(360deg)}}"
-".spinner{width:40px;height:40px;margin:0 auto 16px;border:3px solid #2a2a4a;"
-"border-top-color:#5577ff;border-radius:50%;animation:spin 0.8s linear infinite}"
-"#status{font-size:14px;color:#aac;margin-bottom:12px;min-height:20px}"
-"#log{text-align:left;background:#0d0d1a;border:1px solid #2a2a4a;"
-"border-radius:8px;padding:10px 12px;max-height:240px;overflow-y:auto;"
-"font-size:12px;font-family:'SF Mono',Menlo,Consolas,monospace;"
-"line-height:1.6;color:#8a8aaa}"
-"#log .ts{color:#555;margin-right:6px}"
-"</style></head><body>"
-"<div class=\"card\">"
-"<h1>Scanning...</h1>"
-"<div class=\"sub\">Network Discovery &amp; 3D Visualization</div>"
-"<div class=\"spinner\"></div>"
-"<div id=\"status\">Initializing...</div>"
-"<div id=\"log\"></div>"
-"</div>"
-"<script>"
-"var t0=Date.now();"
-"function ts(){var s=((Date.now()-t0)/1000).toFixed(1);return '<span class=\"ts\">'+s+'s</span>';}"
-"function updateProgress(msg){"
-"document.getElementById('status').textContent=msg;"
-"var log=document.getElementById('log');"
-"log.innerHTML+=ts()+msg+'<br>';"
-"log.scrollTop=log.scrollHeight;}"
-"function finishWithHtml(b64){"
-"var html=atob(b64);"
-"document.open();document.write(html);document.close();}"
-"</script>\n";
-
-/* ---------- progress callback for chunked streaming -------------------- */
-
-static void web_progress_cb(const char *msg, void *ctx)
-{
-    int fd = *(int *)ctx;
-    /* Escape for JS string: backslash, quotes, angle brackets */
-    char escaped[1024];
-    size_t j = 0;
-    for (size_t i = 0; msg[i] && j < sizeof(escaped) - 6; i++) {
-        switch (msg[i]) {
-        case '\\': escaped[j++] = '\\'; escaped[j++] = '\\'; break;
-        case '\'': escaped[j++] = '\\'; escaped[j++] = '\''; break;
-        case '"':  escaped[j++] = '\\'; escaped[j++] = '"';  break;
-        case '<':  escaped[j++] = '\\'; escaped[j++] = 'x'; escaped[j++] = '3'; escaped[j++] = 'c'; break;
-        case '>':  escaped[j++] = '\\'; escaped[j++] = 'x'; escaped[j++] = '3'; escaped[j++] = 'e'; break;
-        case '\n': escaped[j++] = ' '; break;
-        default:   escaped[j++] = msg[i]; break;
-        }
-    }
-    escaped[j] = '\0';
-
-    char chunk[1200];
-    int len = snprintf(chunk, sizeof(chunk),
-        "<script>updateProgress(\"%s\")</script>\n", escaped);
-    if (len > 0)
-        send_chunk(fd, chunk, (size_t)len);
-}
 
 /* ---------- request handler --------------------------------------------- */
 
-static void handle_request(int fd, const ri_config_t *defaults)
+static void handle_request(int fd, int srv_fd, const ri_config_t *defaults)
 {
     char buf[8192];
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
@@ -308,6 +354,7 @@ static void handle_request(int fd, const ri_config_t *defaults)
     char method[8] = {0}, path[256] = {0};
     sscanf(buf, "%7s %255s", method, path);
 
+    /* GET / — serve form */
     if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
         send_response(fd, "200 OK", "text/html",
                       FORM_PAGE, sizeof(FORM_PAGE) - 1);
@@ -315,15 +362,14 @@ static void handle_request(int fd, const ri_config_t *defaults)
         return;
     }
 
+    /* POST /scan — fork child, redirect to progress page */
     if (strcmp(method, "POST") == 0 && strcmp(path, "/scan") == 0) {
-        /* Find body after \r\n\r\n */
         const char *body = strstr(buf, "\r\n\r\n");
         if (!body) { send_error(fd, "400 Bad Request", "Malformed"); close(fd); return; }
         body += 4;
 
-        /* Build config from form */
         ri_config_t cfg = *defaults;
-        cfg.web_mode = 0; /* don't recurse */
+        cfg.web_mode = 0;
 
         char tmp[256];
         if (form_get_param(body, "target", tmp, sizeof(tmp)) && tmp[0]) {
@@ -344,83 +390,200 @@ static void handle_request(int fd, const ri_config_t *defaults)
         cfg.subnet_scan  = form_get_checkbox(body, "subnet_scan");
         cfg.hop_scan     = form_get_checkbox(body, "hop_scan");
 
-        LOG_INFO("Web scan: target=%s depth=%d",
-                 cfg.has_target ? cfg.target : "(local)", cfg.max_depth);
+        /* Create scan ID and temp directory */
+        char scan_id[16];
+        make_scan_id(scan_id, sizeof(scan_id));
 
-        /* --- Begin chunked streaming response --- */
-        const char *chunked_hdr =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/html; charset=utf-8\r\n"
-            "Transfer-Encoding: chunked\r\n"
-            "Cache-Control: no-cache\r\n"
-            "Connection: close\r\n"
-            "\r\n";
-        write(fd, chunked_hdr, strlen(chunked_hdr));
-
-        /* Send the progress page as the first chunk */
-        send_chunk(fd, PROGRESS_PAGE, sizeof(PROGRESS_PAGE) - 1);
-
-        /* Set up progress callback */
-        ri_scan_set_progress(web_progress_cb, &fd);
-
-        /* Run scan pipeline with streaming progress */
-        ri_graph_t *g = ri_scan_run(&cfg);
-        if (!g) {
-            send_chunk_str(fd,
-                "<script>updateProgress(\"Scan failed!\")</script>\n");
-            send_chunked_end(fd);
-            ri_scan_set_progress(NULL, NULL);
+        char scan_dir[256];
+        snprintf(scan_dir, sizeof(scan_dir), "/tmp/vt-%s", scan_id);
+        if (mkdir(scan_dir, 0700) != 0) {
+            send_error(fd, "500 Internal Server Error", "Cannot create temp dir");
             close(fd);
             return;
         }
 
-        web_progress_cb("Computing MST...", &fd);
-        ri_graph_kruskal_mst(g);
+        LOG_INFO("Web scan [%s]: target=%s depth=%d",
+                 scan_id, cfg.has_target ? cfg.target : "(local)", cfg.max_depth);
 
-        web_progress_cb("Computing 3D layout...", &fd);
-        ri_layout_3d(g);
-        ri_layout_force_refine(g, 50);
+        pid_t pid = fork();
+        if (pid < 0) {
+            send_error(fd, "500 Internal Server Error", "Fork failed");
+            close(fd);
+            return;
+        }
 
-        web_progress_cb("Generating visualization...", &fd);
-        char *html = ri_out_html_string(g);
-        ri_graph_destroy(g);
+        if (pid == 0) {
+            /* Child process */
+            close(fd);
+            run_scan_child(&cfg, scan_dir, srv_fd);
+            /* run_scan_child calls _exit() — never returns */
+        }
 
+        /* Parent: redirect browser to progress page */
+        char location[128];
+        snprintf(location, sizeof(location), "/progress/%s", scan_id);
+        send_redirect(fd, location);
+        close(fd);
+        return;
+    }
+
+    /* GET /progress/{id} — serve polling progress page */
+    if (strcmp(method, "GET") == 0 && strncmp(path, "/progress/", 10) == 0) {
+        const char *scan_id = path + 10;
+        char scan_dir[256];
+        snprintf(scan_dir, sizeof(scan_dir), "/tmp/vt-%s", scan_id);
+
+        /* Check scan dir exists */
+        struct stat st;
+        if (stat(scan_dir, &st) != 0) {
+            send_error(fd, "404 Not Found", "Unknown scan ID");
+            close(fd);
+            return;
+        }
+
+        /* If done, redirect straight to result */
+        char done_path[512];
+        snprintf(done_path, sizeof(done_path), "%s/done", scan_dir);
+        if (stat(done_path, &st) == 0) {
+            char location[128];
+            snprintf(location, sizeof(location), "/result/%s", scan_id);
+            send_redirect(fd, location);
+            close(fd);
+            return;
+        }
+
+        char *page = build_progress_page(scan_id);
+        if (!page) {
+            send_error(fd, "500 Internal Server Error", "OOM");
+            close(fd);
+            return;
+        }
+        send_response(fd, "200 OK", "text/html", page, strlen(page));
+        free(page);
+        close(fd);
+        return;
+    }
+
+    /* GET /api/status/{id} — JSON status for polling */
+    if (strcmp(method, "GET") == 0 && strncmp(path, "/api/status/", 12) == 0) {
+        const char *scan_id = path + 12;
+        char scan_dir[256];
+        snprintf(scan_dir, sizeof(scan_dir), "/tmp/vt-%s", scan_id);
+
+        struct stat st;
+        if (stat(scan_dir, &st) != 0) {
+            const char *json = "{\"status\":\"error\",\"lines\":[\"Unknown scan ID\"]}";
+            send_response(fd, "200 OK", "application/json", json, strlen(json));
+            close(fd);
+            return;
+        }
+
+        /* Determine status */
+        const char *status_str = "running";
+        char done_path[512], error_path[512];
+        snprintf(done_path, sizeof(done_path), "%s/done", scan_dir);
+        snprintf(error_path, sizeof(error_path), "%s/error", scan_dir);
+        if (stat(done_path, &st) == 0)
+            status_str = "done";
+        else if (stat(error_path, &st) == 0)
+            status_str = "error";
+
+        /* Read progress.log lines */
+        char log_path[512];
+        snprintf(log_path, sizeof(log_path), "%s/progress.log", scan_dir);
+
+        /* Build JSON response with lines array */
+        char *json = malloc(65536);
+        if (!json) {
+            send_error(fd, "500 Internal Server Error", "OOM");
+            close(fd);
+            return;
+        }
+
+        int jlen = snprintf(json, 65536, "{\"status\":\"%s\",\"lines\":[", status_str);
+
+        FILE *lf = fopen(log_path, "r");
+        if (lf) {
+            char line[512];
+            int first = 1;
+            while (fgets(line, sizeof(line), lf)) {
+                /* Strip trailing newline */
+                size_t ll = strlen(line);
+                while (ll > 0 && (line[ll-1] == '\n' || line[ll-1] == '\r'))
+                    line[--ll] = '\0';
+                if (ll == 0) continue;
+
+                /* JSON-escape the line */
+                char escaped[1024];
+                size_t ei = 0;
+                for (size_t li = 0; li < ll && ei < sizeof(escaped) - 4; li++) {
+                    switch (line[li]) {
+                    case '"':  escaped[ei++] = '\\'; escaped[ei++] = '"'; break;
+                    case '\\': escaped[ei++] = '\\'; escaped[ei++] = '\\'; break;
+                    case '\t': escaped[ei++] = ' '; break;
+                    default:
+                        if ((unsigned char)line[li] >= 0x20)
+                            escaped[ei++] = line[li];
+                        break;
+                    }
+                }
+                escaped[ei] = '\0';
+
+                if (jlen < 65000) {
+                    jlen += snprintf(json + jlen, 65536 - (size_t)jlen,
+                                     "%s\"%s\"", first ? "" : ",", escaped);
+                    first = 0;
+                }
+            }
+            fclose(lf);
+        }
+
+        jlen += snprintf(json + jlen, 65536 - (size_t)jlen, "]}");
+
+        send_response(fd, "200 OK", "application/json", json, (size_t)jlen);
+        free(json);
+        close(fd);
+        return;
+    }
+
+    /* GET /result/{id} — serve the generated HTML */
+    if (strcmp(method, "GET") == 0 && strncmp(path, "/result/", 8) == 0) {
+        const char *scan_id = path + 8;
+        char result_path[512];
+        snprintf(result_path, sizeof(result_path), "/tmp/vt-%s/result.html", scan_id);
+
+        FILE *rf = fopen(result_path, "r");
+        if (!rf) {
+            send_error(fd, "404 Not Found", "Result not ready");
+            close(fd);
+            return;
+        }
+
+        /* Get file size */
+        fseek(rf, 0, SEEK_END);
+        long fsize = ftell(rf);
+        fseek(rf, 0, SEEK_SET);
+
+        if (fsize <= 0 || fsize > 50 * 1024 * 1024) {
+            fclose(rf);
+            send_error(fd, "500 Internal Server Error", "Bad result file");
+            close(fd);
+            return;
+        }
+
+        char *html = malloc((size_t)fsize);
         if (!html) {
-            send_chunk_str(fd,
-                "<script>updateProgress(\"HTML generation failed!\")</script>\n");
-            send_chunked_end(fd);
-            ri_scan_set_progress(NULL, NULL);
+            fclose(rf);
+            send_error(fd, "500 Internal Server Error", "OOM");
             close(fd);
             return;
         }
 
-        /* Base64-encode the visualization HTML and send as final script */
-        char *b64 = base64_encode((const unsigned char *)html, strlen(html));
+        size_t nread = fread(html, 1, (size_t)fsize, rf);
+        fclose(rf);
+
+        send_response(fd, "200 OK", "text/html", html, nread);
         free(html);
-
-        if (!b64) {
-            send_chunk_str(fd,
-                "<script>updateProgress(\"Encoding failed!\")</script>\n");
-            send_chunked_end(fd);
-            ri_scan_set_progress(NULL, NULL);
-            close(fd);
-            return;
-        }
-
-        /* Build the finish script: <script>finishWithHtml("BASE64")</script> */
-        size_t b64_len = strlen(b64);
-        size_t script_len = 34 + b64_len + 11; /* prefix + b64 + suffix */
-        char *script = malloc(script_len + 1);
-        if (script) {
-            snprintf(script, script_len + 1,
-                     "<script>finishWithHtml(\"%s\")</script>\n", b64);
-            send_chunk(fd, script, strlen(script));
-            free(script);
-        }
-        free(b64);
-
-        send_chunked_end(fd);
-        ri_scan_set_progress(NULL, NULL);
         close(fd);
         return;
     }
@@ -506,6 +669,13 @@ int ri_web_serve(const ri_config_t *defaults)
     sa.sa_handler = sigint_handler;
     sigaction(SIGINT, &sa, NULL);
 
+    /* Auto-reap child processes */
+    struct sigaction sa_chld;
+    memset(&sa_chld, 0, sizeof(sa_chld));
+    sa_chld.sa_handler = SIG_DFL;
+    sa_chld.sa_flags = SA_NOCLDWAIT;
+    sigaction(SIGCHLD, &sa_chld, NULL);
+
     while (!g_shutdown) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -524,10 +694,11 @@ int ri_web_serve(const ri_config_t *defaults)
             if (errno == EINTR) continue;
             break;
         }
-        handle_request(client, defaults);
+        handle_request(client, srv, defaults);
     }
 
     close(srv);
+    cleanup_temp_dirs();
     printf("\nShutting down.\n");
     return 0;
 }

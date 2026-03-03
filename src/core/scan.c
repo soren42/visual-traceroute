@@ -12,6 +12,7 @@
 #include "util/strutil.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
 #include <arpa/inet.h>
@@ -147,6 +148,131 @@ int ri_scan_name_resolution(ri_graph_t *g, const ri_config_t *cfg)
     return 0;
 }
 
+/* ---------- BFS expansion around a timeout gap ------------------------- */
+
+static void expand_around_hop(ri_graph_t *g, int start_id, int max_depth)
+{
+    /* BFS queue: array of host IDs at current and next levels */
+    int queue_cap = 64;
+    int *cur_queue  = malloc((size_t)queue_cap * sizeof(int));
+    int *next_queue = malloc((size_t)queue_cap * sizeof(int));
+    if (!cur_queue || !next_queue) {
+        free(cur_queue);
+        free(next_queue);
+        return;
+    }
+
+    /* Track scanned subnets to avoid re-scanning */
+    int subnets_cap = 64;
+    int subnets_count = 0;
+    uint32_t *scanned_subnets = malloc((size_t)subnets_cap * sizeof(uint32_t));
+    if (!scanned_subnets) {
+        free(cur_queue);
+        free(next_queue);
+        return;
+    }
+
+    int cur_count = 1;
+    int next_count = 0;
+    cur_queue[0] = start_id;
+
+    for (int depth = 0; depth < max_depth; depth++) {
+        next_count = 0;
+
+        for (int qi = 0; qi < cur_count; qi++) {
+            int host_id = cur_queue[qi];
+            if (!g->hosts[host_id].has_ipv4) continue;
+
+            uint32_t net = ntohl(g->hosts[host_id].ipv4.s_addr) & 0xFFFFFF00;
+
+            /* Check if already scanned this subnet */
+            int already = 0;
+            for (int s = 0; s < subnets_count; s++) {
+                if (scanned_subnets[s] == net) { already = 1; break; }
+            }
+            if (already) continue;
+
+            /* Record this subnet */
+            if (subnets_count >= subnets_cap) {
+                subnets_cap *= 2;
+                uint32_t *tmp = realloc(scanned_subnets,
+                                        (size_t)subnets_cap * sizeof(uint32_t));
+                if (!tmp) goto done;
+                scanned_subnets = tmp;
+            }
+            scanned_subnets[subnets_count++] = net;
+
+            LOG_INFO("Hop expand: depth %d, probing %d.%d.%d.0/24",
+                     depth + 1,
+                     (net >> 24) & 0xFF, (net >> 16) & 0xFF,
+                     (net >> 8) & 0xFF);
+            scan_progress("Hop expand: depth %d, probing %d.%d.%d.0/24...",
+                          depth + 1,
+                          (net >> 24) & 0xFF, (net >> 16) & 0xFF,
+                          (net >> 8) & 0xFF);
+
+            int scan_count = 0;
+            for (uint32_t h = 1; h < 255; h++) {
+                struct in_addr probe;
+                probe.s_addr = htonl(net | h);
+
+                int existing = ri_graph_find_by_ipv4(g, probe);
+                if (existing >= 0) continue;
+
+                double probe_rtt = ri_icmp_ping(probe, 500);
+                if (probe_rtt < 0) continue;
+
+                ri_host_t ph;
+                ri_host_init(&ph);
+                ri_host_set_ipv4_addr(&ph, probe);
+                ph.type = RI_HOST_REMOTE;
+                ph.rtt_ms = probe_rtt;
+                int pid = ri_graph_add_host(g, &ph);
+                ri_graph_add_edge(g, host_id, pid,
+                                  probe_rtt > 0 ? probe_rtt : 1.0,
+                                  RI_EDGE_LAN);
+                scan_count++;
+
+                /* Enqueue newly discovered host for next BFS level */
+                if (next_count >= queue_cap) {
+                    queue_cap *= 2;
+                    int *tmp = realloc(next_queue,
+                                       (size_t)queue_cap * sizeof(int));
+                    if (!tmp) goto done;
+                    next_queue = tmp;
+                    tmp = realloc(cur_queue,
+                                  (size_t)queue_cap * sizeof(int));
+                    if (!tmp) goto done;
+                    cur_queue = tmp;
+                }
+                next_queue[next_count++] = pid;
+            }
+
+            if (scan_count > 0) {
+                LOG_INFO("Hop expand: %d neighbor(s) at depth %d",
+                         scan_count, depth + 1);
+                scan_progress("Hop expand: %d neighbor(s) at depth %d",
+                              scan_count, depth + 1);
+            }
+        }
+
+        if (next_count == 0) break;
+
+        /* Swap queues for next level */
+        int *tmp = cur_queue;
+        cur_queue = next_queue;
+        next_queue = tmp;
+        cur_count = next_count;
+    }
+
+done:
+    free(cur_queue);
+    free(next_queue);
+    free(scanned_subnets);
+}
+
+/* ----------------------------------------------------------------------- */
+
 int ri_scan_traceroute(ri_graph_t *g, const ri_config_t *cfg)
 {
     if (!cfg->has_target) {
@@ -166,8 +292,6 @@ int ri_scan_traceroute(ri_graph_t *g, const ri_config_t *cfg)
 
     int prev_id = -1;
     int max_ttl = RI_MAX_HOPS;
-    int gateway_seen = 0;
-    int hops_after_gw = 0;
 
     /* Find local host as starting point */
     for (int i = 0; i < g->host_count; i++) {
@@ -184,6 +308,9 @@ int ri_scan_traceroute(ri_graph_t *g, const ri_config_t *cfg)
                                &reply_addr, &rtt);
         if (rc < 0) {
             LOG_DEBUG("TTL %d: no response", ttl);
+            /* Expand around the last known-good hop on timeout */
+            if (cfg->hop_scan && prev_id >= 0 && cfg->max_depth > 0)
+                expand_around_hop(g, prev_id, cfg->max_depth);
             continue;
         }
 
@@ -213,62 +340,11 @@ int ri_scan_traceroute(ri_graph_t *g, const ri_config_t *cfg)
             ri_graph_add_edge(g, prev_id, hop_id, w, RI_EDGE_ROUTE);
         }
 
-        /* Probe /24 around this hop if --hop-scan enabled */
-        if (cfg->hop_scan && g->hosts[hop_id].type != RI_HOST_GATEWAY) {
-            uint32_t hop_net = ntohl(reply_addr.s_addr) & 0xFFFFFF00;
-            int scan_count = 0;
-            LOG_INFO("Hop scan: probing %d.%d.%d.0/24",
-                     (hop_net >> 24) & 0xFF, (hop_net >> 16) & 0xFF,
-                     (hop_net >> 8) & 0xFF);
-            scan_progress("Hop scan: probing %d.%d.%d.0/24...",
-                          (hop_net >> 24) & 0xFF, (hop_net >> 16) & 0xFF,
-                          (hop_net >> 8) & 0xFF);
-            for (uint32_t h = 1; h < 255; h++) {
-                struct in_addr probe;
-                probe.s_addr = htonl(hop_net | h);
-                if (probe.s_addr == reply_addr.s_addr) continue;
-                if (ri_graph_find_by_ipv4(g, probe) >= 0) continue;
-
-                double probe_rtt = ri_icmp_ping(probe, 500);
-                if (probe_rtt < 0) continue;
-
-                ri_host_t ph;
-                ri_host_init(&ph);
-                ri_host_set_ipv4_addr(&ph, probe);
-                ph.type = RI_HOST_REMOTE;
-                ph.hop_distance = ttl;
-                ph.rtt_ms = probe_rtt;
-                int pid = ri_graph_add_host(g, &ph);
-                ri_graph_add_edge(g, hop_id, pid, probe_rtt > 0 ? probe_rtt : 1.0,
-                                  RI_EDGE_LAN);
-                scan_count++;
-
-                char abuf[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &probe, abuf, sizeof(abuf));
-                LOG_DEBUG("Hop scan: found %s (%.1f ms)", abuf, probe_rtt);
-            }
-            if (scan_count > 0) {
-                LOG_INFO("Hop scan: %d neighbor(s) at TTL %d", scan_count, ttl);
-                scan_progress("Hop scan: %d neighbor(s) at TTL %d", scan_count, ttl);
-            }
-        }
-
         /* Check if reached target */
         if (reply_addr.s_addr == target_addr.s_addr) {
             g->hosts[hop_id].type = RI_HOST_TARGET;
             LOG_INFO("Reached target in %d hops", ttl);
             break;
-        }
-
-        /* Depth limiting past gateway */
-        if (g->hosts[hop_id].type == RI_HOST_GATEWAY)
-            gateway_seen = 1;
-        if (gateway_seen) {
-            hops_after_gw++;
-            if (hops_after_gw >= cfg->max_depth) {
-                LOG_INFO("Reached max depth %d", cfg->max_depth);
-                break;
-            }
         }
 
         prev_id = hop_id;
